@@ -6,11 +6,6 @@
 #include <cuda_runtime.h>
 #include "cuda_rm.h"
 
-#define CHUNK_SIZE 512
-#define CLEAN_GAIN 0.1f
-#define CLEAN_THRESHOLD 1e-3f
-#define CLEAN_MAX_ITER 100
-
 typedef struct {
     int NFREQ;
     int NY, NX;
@@ -32,6 +27,73 @@ typedef struct {
     float f_max;
     float f_res;
 } FaradayParams;
+
+typedef struct {
+    int chunk_size;
+    float clean_gain;
+    float clean_threshold;
+    int clean_max_iter;
+} ProcessParams;
+
+// ============================================================================
+// GPU MEMORY DETECTION
+// ============================================================================
+
+size_t get_available_vram() {
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    return free_mem;
+}
+
+void print_vram_info() {
+    size_t free_mem, total_mem;
+    cudaMemGetInfo(&free_mem, &total_mem);
+    printf("GPU Memory: %.1f GB free / %.1f GB total\n", 
+           free_mem / (1024.0f * 1024.0f * 1024.0f),
+           total_mem / (1024.0f * 1024.0f * 1024.0f));
+}
+
+// ============================================================================
+// AUTO-DETECT CHUNK SIZE BASED ON VRAM AND CUBE SIZE
+// ============================================================================
+
+int auto_detect_chunk_size(int nfreq, int ny, int nx, size_t available_vram) {
+    // Memory per pixel per channel (float)
+    size_t bytes_per_pixel_per_freq = 4;  // float32
+    
+    // Estimate memory for one chunk:
+    // - Q, U, I input: 3 * chunk_size^2 * nfreq * 4 bytes
+    // - Intermediate: Q_norm, U_norm, I_fit: 3 * chunk_size^2 * nfreq * 4 bytes
+    // - RMSF output: chunk_size^2 * nfara * 8 bytes (float2)
+    // - Peak, RM, Err, Clean: 4 * chunk_size^2 * 4 bytes
+    // Total rough estimate: ~10 * chunk_size^2 * nfreq * 4 bytes
+    
+    // Reserve 20% of VRAM for safety
+    size_t usable_vram = (available_vram * 80) / 100;
+    
+    // Estimate: 10 * chunk^2 * nfreq * 4 < usable_vram
+    // chunk^2 < usable_vram / (10 * nfreq * 4)
+    float chunk_float = sqrtf((float)usable_vram / (10.0f * nfreq * 4.0f));
+    int chunk_size = (int)chunk_float;
+    
+    // Clamp to reasonable values
+    if (chunk_size < 64) chunk_size = 64;
+    if (chunk_size > 1024) chunk_size = 1024;
+    
+    // Round to nearest power of 2 for efficiency
+    int powers[] = {64, 128, 256, 512, 1024};
+    int best = 64;
+    for (int i = 0; i < 5; i++) {
+        if (powers[i] <= chunk_size) {
+            best = powers[i];
+        }
+    }
+    
+    printf("Auto-detected chunk size: %d×%d (based on %.1f GB available VRAM)\n",
+           best, best, usable_vram / (1024.0f * 1024.0f * 1024.0f));
+    
+    return best;
+}
 
 // ============================================================================
 // FITS I/O
@@ -196,7 +258,7 @@ int write_fits_cube(const char *filename, float *data, int ny, int nx, int nfara
 }
 
 // ============================================================================
-// FARADAY GRID - USER CONTROLLED
+// FARADAY GRID
 // ============================================================================
 
 void create_faraday_grid(
@@ -228,43 +290,58 @@ void create_faraday_grid(
 // COMMAND-LINE PARSING
 // ============================================================================
 
-void parse_faraday_args(int argc, char **argv, FaradayParams *params) {
+void parse_user_args(int argc, char **argv, FaradayParams *fara_params, ProcessParams *proc_params) {
     // Defaults
-    params->f_min = -500.0f;
-    params->f_max = 500.0f;
-    params->f_res = 5.0f;
+    fara_params->f_min = -500.0f;
+    fara_params->f_max = 500.0f;
+    fara_params->f_res = 5.0f;
+    
+    proc_params->chunk_size = 0;  // 0 = auto-detect
+    proc_params->clean_gain = 0.1f;
+    proc_params->clean_threshold = 1e-3f;
+    proc_params->clean_max_iter = 100;
     
     // Parse arguments
     for (int i = 1; i < argc - 1; i++) {
         if (strcmp(argv[i], "-f_min") == 0) {
-            params->f_min = atof(argv[++i]);
+            fara_params->f_min = atof(argv[++i]);
         } else if (strcmp(argv[i], "-f_max") == 0) {
-            params->f_max = atof(argv[++i]);
+            fara_params->f_max = atof(argv[++i]);
         } else if (strcmp(argv[i], "-f_res") == 0) {
-            params->f_res = atof(argv[++i]);
+            fara_params->f_res = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-chunk") == 0) {
+            proc_params->chunk_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-gain") == 0) {
+            proc_params->clean_gain = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-threshold") == 0) {
+            proc_params->clean_threshold = atof(argv[++i]);
+        } else if (strcmp(argv[i], "-max_iter") == 0) {
+            proc_params->clean_max_iter = atoi(argv[++i]);
         }
     }
 }
 
 void print_usage(const char *prog) {
     printf("Usage: %s Q.fits U.fits I.fits mask.fits frequencies.txt output_prefix\n", prog);
-    printf("       [weights.txt] [-f_min MIN] [-f_max MAX] [-f_res RES]\n\n");
+    printf("       [weights.txt] [options]\n\n");
     printf("Required:\n");
-    printf("  Q.fits                 - Stokes Q cube (NFREQ, NY, NX)\n");
-    printf("  U.fits                 - Stokes U cube (NFREQ, NY, NX)\n");
-    printf("  I.fits                 - Stokes I cube (NFREQ, NY, NX)\n");
-    printf("  mask.fits              - Source mask (NY, NX), 1=source, 0=noise\n");
-    printf("  frequencies.txt        - One frequency per line (Hz)\n");
-    printf("  output_prefix          - Prefix for output files\n\n");
-    printf("Optional:\n");
-    printf("  weights.txt            - Per-channel weights (auto-computed if missing)\n");
-    printf("  -f_min MIN             - Minimum Faraday depth [rad/m²] (default: -500)\n");
-    printf("  -f_max MAX             - Maximum Faraday depth [rad/m²] (default: 500)\n");
-    printf("  -f_res RES             - Faraday resolution [rad/m²] (default: 5)\n\n");
+    printf("  Q.fits, U.fits, I.fits          - Stokes cubes (NFREQ, NY, NX)\n");
+    printf("  mask.fits                       - Source mask (1=source, 0=noise)\n");
+    printf("  frequencies.txt                 - One frequency per line (Hz)\n");
+    printf("  output_prefix                   - Prefix for output files\n\n");
+    printf("Optional arguments:\n");
+    printf("  weights.txt                     - Per-channel weights (auto-computed if missing)\n");
+    printf("  -f_min MIN                      - Min Faraday depth [rad/m²] (default: -500)\n");
+    printf("  -f_max MAX                      - Max Faraday depth [rad/m²] (default: 500)\n");
+    printf("  -f_res RES                      - Faraday resolution [rad/m²] (default: 5)\n");
+    printf("  -chunk SIZE                     - Chunk size in pixels (default: auto-detect)\n");
+    printf("  -gain GAIN                      - RM-CLEAN gain [0-1] (default: 0.1)\n");
+    printf("  -threshold THR                  - RM-CLEAN threshold (default: 1e-3)\n");
+    printf("  -max_iter ITER                  - Max RM-CLEAN iterations (default: 100)\n\n");
     printf("Examples:\n");
     printf("  %s Q.fits U.fits I.fits mask.fits freq.txt output\n", prog);
-    printf("  %s Q.fits U.fits I.fits mask.fits freq.txt output -f_min -1000 -f_max 1000 -f_res 10\n", prog);
-    printf("  %s Q.fits U.fits I.fits mask.fits freq.txt output weights.txt -f_min -100 -f_max 100 -f_res 1\n", prog);
+    printf("  %s Q.fits U.fits I.fits mask.fits freq.txt output -f_min -1000 -f_max 1000\n", prog);
+    printf("  %s Q.fits U.fits I.fits mask.fits freq.txt output weights.txt -chunk 256 -gain 0.05\n", prog);
 }
 
 // ============================================================================
@@ -279,6 +356,7 @@ void process_chunk(
     float *d_fara_grid,
     float *d_weights,
     int nfara,
+    ProcessParams *proc_params,
     int y_start, int x_start,
     int chunk_ny, int chunk_nx
 ) {
@@ -339,7 +417,8 @@ void process_chunk(
     
     cu_compute_rmsf(d_Q_norm, d_U_norm, d_lambda_sq, d_weights, d_fara_grid, d_rmsf, nfreq, nfara, n_valid);
     cu_find_peak_rm(d_rmsf, d_fara_grid, d_peak_rm, d_rm_value, d_rm_err, nfara, n_valid);
-    cu_rm_clean(d_rmsf, d_rm_value, d_peak_rm, d_fara_grid, d_rm_clean, nfara, n_valid, CLEAN_GAIN, CLEAN_THRESHOLD, CLEAN_MAX_ITER);
+    cu_rm_clean(d_rmsf, d_rm_value, d_peak_rm, d_fara_grid, d_rm_clean, nfara, n_valid, 
+                proc_params->clean_gain, proc_params->clean_threshold, proc_params->clean_max_iter);
     
     float *h_peak_rm = (float *)malloc(n_valid * sizeof(float));
     float *h_rm_value = (float *)malloc(n_valid * sizeof(float));
@@ -395,16 +474,17 @@ int main(int argc, char **argv) {
     const char *output_prefix = argv[6];
     const char *weights_file = NULL;
     
-    // Check if next arg is weights file (doesn't start with -)
     if (argc > 7 && argv[7][0] != '-') {
         weights_file = argv[7];
     }
     
-    // Parse Faraday parameters
     FaradayParams fara_params;
-    parse_faraday_args(argc, argv, &fara_params);
+    ProcessParams proc_params;
+    parse_user_args(argc, argv, &fara_params, &proc_params);
     
     printf("=== RM Estimation + RM-CLEAN ===\n");
+    print_vram_info();
+    printf("\n");
     printf("Loading data...\n");
     
     DataCube data = {0};
@@ -415,6 +495,15 @@ int main(int argc, char **argv) {
     read_frequencies(freq_file, &data.freq, &data.NFREQ);
     
     printf("Data loaded: NFREQ=%d, NY=%d, NX=%d\n", data.NFREQ, data.NY, data.NX);
+    printf("Cube size: %.2f GB\n", (data.NFREQ * data.NY * data.NX * 4.0 * 3) / (1024*1024*1024));
+    
+    // Auto-detect chunk size if not provided
+    if (proc_params.chunk_size == 0) {
+        size_t available = get_available_vram();
+        proc_params.chunk_size = auto_detect_chunk_size(data.NFREQ, data.NY, data.NX, available);
+    } else {
+        printf("Using user-specified chunk size: %d×%d\n", proc_params.chunk_size, proc_params.chunk_size);
+    }
     
     float *weights = NULL;
     if (weights_file) {
@@ -433,6 +522,10 @@ int main(int argc, char **argv) {
     float *fara_grid;
     int nfara;
     create_faraday_grid(fara_params.f_min, fara_params.f_max, fara_params.f_res, &fara_grid, &nfara);
+    
+    printf("RM-CLEAN parameters: gain=%.3f, threshold=%.2e, max_iter=%d\n",
+           proc_params.clean_gain, proc_params.clean_threshold, proc_params.clean_max_iter);
+    printf("\n");
     
     OutputMaps output;
     output.rm_map = (float *)malloc(data.NY * data.NX * sizeof(float));
@@ -466,12 +559,13 @@ int main(int argc, char **argv) {
     
     printf("Processing chunks...\n");
     
-    for (int y = 0; y < data.NY; y += CHUNK_SIZE) {
-        for (int x = 0; x < data.NX; x += CHUNK_SIZE) {
-            int chunk_ny = (y + CHUNK_SIZE > data.NY) ? (data.NY - y) : CHUNK_SIZE;
-            int chunk_nx = (x + CHUNK_SIZE > data.NX) ? (data.NX - x) : CHUNK_SIZE;
+    for (int y = 0; y < data.NY; y += proc_params.chunk_size) {
+        for (int x = 0; x < data.NX; x += proc_params.chunk_size) {
+            int chunk_ny = (y + proc_params.chunk_size > data.NY) ? (data.NY - y) : proc_params.chunk_size;
+            int chunk_nx = (x + proc_params.chunk_size > data.NX) ? (data.NX - x) : proc_params.chunk_size;
             
-            process_chunk(&data, &output, d_freq, d_lambda_sq, d_fara_grid, d_weights, nfara, y, x, chunk_ny, chunk_nx);
+            process_chunk(&data, &output, d_freq, d_lambda_sq, d_fara_grid, d_weights, nfara, 
+                         &proc_params, y, x, chunk_ny, chunk_nx);
         }
     }
     
@@ -494,7 +588,6 @@ int main(int argc, char **argv) {
     write_fits_image(filename, output.peak_rm_map, data.NY, data.NX);
     printf("  %s\n", filename);
     
-    // Split RMSF into real and imaginary parts
     float *rmsf_real = (float *)malloc(data.NY * data.NX * nfara * sizeof(float));
     float *rmsf_imag = (float *)malloc(data.NY * data.NX * nfara * sizeof(float));
     
