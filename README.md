@@ -1,5 +1,11 @@
 # VROOM - GPU RM-Synthesis + RM-CLEAN
 
+<p align="center">
+  <img src="assets/cat-driving.gif" width="400"/>
+</p>
+
+*Taken from [Tenor](https://tenor.com/view/cat-driving-serious-cat-driving-driving-fast-gif-12051647047998874147)*
+
 Fast GPU-accelerated Rotation Measure synthesis and RM-CLEAN deconvolution for radio polarimetry, using **NUFFT** for optimal performance with non-uniform λ² sampling.
 
 ## Features
