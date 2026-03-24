@@ -1,7 +1,7 @@
 # VROOM - GPU RM-Synthesis + RM-CLEAN
 
 <p align="center">
-  <img src="assets/cat-driving.gif" width="400"/>
+  <img src="assets/cat-driving-serious.gif" width="400"/>
 </p>
 
 *Taken from [Tenor](https://tenor.com/view/cat-driving-serious-cat-driving-driving-fast-gif-12051647047998874147)*
